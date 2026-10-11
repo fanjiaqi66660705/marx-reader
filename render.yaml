@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: marx-reader
+    env: static
+    buildCommand: npm ci && npm run build
+    staticPublishPath: out
+    envVars:
+      - key: NEXT_PUBLIC_SF_API_KEY
+        value: sk-urmcukzymyktnghapvjzuejvevyufcnzgjttlvoyutdhndtv

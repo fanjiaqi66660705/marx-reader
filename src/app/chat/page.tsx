@@ -1,14 +1,21 @@
 "use client";
 
 import { useRef, useState } from "react";
+import {
+  retrieve,
+  streamChat,
+  type Citation,
+  type ChatMessage as ApiMessage,
+} from "@/lib/client-rag";
 
-interface Citation {
-  childId: number;
-  title: string;
-  chapter: string | null;
-  section: string | null;
-  quote: string;
-}
+const SYSTEM_PROMPT = `你是马克思主义经典文献研读平台的 AI 助手，面向高校学生与理论学习者。
+
+【必须遵守的规则】
+1. 只依据下方提供的「原文片段」回答问题。不得使用片段之外的任何知识编造引文。
+2. 回答中凡涉及原文的论断，必须在句末标注引文编号，如 [1]、[2]，编号对应提供的片段序号。
+3. 如果提供的片段不足以回答问题，直接说明「所提供的文献片段不足以完整回答该问题」，并指出片段中与问题相关的线索。绝不允许编造引文或出处。
+4. 风格：严谨、清晰、面向研读讨论。可分点论述，但避免空洞套话。
+5. 解释概念时，先给出原文依据，再做通俗阐释，最后可提出一个供讨论的延伸问题。`;
 
 interface ChatMessage {
   role: "user" | "assistant";
@@ -37,70 +44,55 @@ export default function ChatPage() {
     setMessages([...history, { role: "assistant", content: "" }]);
     setLoading(true);
 
-    try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: question, history: history.slice(-8) }),
-      });
-      if (!res.ok || !res.body) {
-        throw new Error(`请求失败（${res.status}）`);
-      }
-      // NDJSON 流：每行 {type:'delta'|'citations'|'error'}
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          const event = JSON.parse(line) as {
-            type: string;
-            text?: string;
-            message?: string;
-            citations?: Citation[];
-          };
-          if (event.type === "delta" && event.text) {
-            setMessages((prev) => {
-              const next = [...prev];
-              const last = next[next.length - 1];
-              next[next.length - 1] = { ...last, content: last.content + event.text };
-              return next;
-            });
-            listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
-          } else if (event.type === "citations" && event.citations) {
-            setMessages((prev) => {
-              const next = [...prev];
-              const last = next[next.length - 1];
-              next[next.length - 1] = { ...last, citations: event.citations };
-              return next;
-            });
-          } else if (event.type === "error") {
-            setMessages((prev) => {
-              const next = [...prev];
-              const last = next[next.length - 1];
-              next[next.length - 1] = {
-                ...last,
-                content: last.content || `⚠️ ${event.message ?? "服务异常"}`,
-              };
-              return next;
-            });
-          }
-        }
-      }
-    } catch (err) {
+    const patchLast = (patch: Partial<ChatMessage>) =>
       setMessages((prev) => {
         const next = [...prev];
         const last = next[next.length - 1];
-        next[next.length - 1] = {
-          ...last,
-          content: last.content || `⚠️ ${err instanceof Error ? err.message : "网络错误"}`,
-        };
+        next[next.length - 1] = { ...last, ...patch };
         return next;
+      });
+
+    try {
+      // 1) 浏览器端检索原文片段（首次会懒加载约 8MB 静态数据）
+      const { contexts, citations } = await retrieve(question);
+      if (contexts.length === 0) {
+        patchLast({ content: "⚠️ 文献库中未检索到相关原文，请换一个与文献内容相关的问题。" });
+        return;
+      }
+
+      // 2) 组装提示词（截断超长父块，防止超出 LLM 上下文窗口）
+      const MAX_PER_CTX = 3000;
+      const MAX_TOTAL = 12000;
+      const contextBlock = contexts
+        .map((text, i) => `[${i + 1}] ${text.slice(0, MAX_PER_CTX)}`)
+        .join("\n\n---\n\n")
+        .slice(0, MAX_TOTAL);
+
+      const historyMessages: ApiMessage[] = history
+        .filter((m) => m.content.trim() && m.content !== question)
+        .slice(-6)
+        .map((m) => ({ role: m.role, content: m.content }));
+
+      const apiMessages: ApiMessage[] = [
+        { role: "system", content: `${SYSTEM_PROMPT}\n\n【原文片段】\n${contextBlock}` },
+        ...historyMessages,
+        { role: "user", content: question },
+      ];
+
+      // 3) 流式输出
+      for await (const delta of streamChat(apiMessages)) {
+        setMessages((prev) => {
+          const next = [...prev];
+          const last = next[next.length - 1];
+          next[next.length - 1] = { ...last, content: last.content + delta };
+          return next;
+        });
+        listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
+      }
+      patchLast({ citations });
+    } catch (err) {
+      patchLast({
+        content: `⚠️ ${err instanceof Error ? err.message : "网络错误"}`,
       });
     } finally {
       setLoading(false);
